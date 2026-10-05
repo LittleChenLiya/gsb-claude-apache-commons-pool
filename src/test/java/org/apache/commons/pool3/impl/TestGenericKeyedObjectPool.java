@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -33,6 +34,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Random;
@@ -308,6 +310,34 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
     }
 
     /**
+     * A key whose identity follows {@link #equals(Object)} rather than object
+     * identity. Two distinct instances with the same id are equal and therefore
+     * share the same keyed sub-pool (and the same per-key waiter quota).
+     */
+    static final class EquatableKey {
+        private final int id;
+
+        EquatableKey(final int id) {
+            this.id = id;
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+            return o instanceof EquatableKey && ((EquatableKey) o).id == id;
+        }
+
+        @Override
+        public int hashCode() {
+            return id;
+        }
+
+        @Override
+        public String toString() {
+            return "key" + id;
+        }
+    }
+
+    /**
      * Very simple test thread that just tries to borrow an object from the provided pool with the specified key and returns it.
      *
      * @param <T> Type of element pooled in the pool.
@@ -454,10 +484,12 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
 
     /*
      * Very simple test thread that just tries to borrow an object from the provided pool with the specified key and returns it after a wait
+     *
+     * @param <K> the key type
      */
-    static class WaitingTestThread<E extends Exception> extends Thread {
-        private final KeyedObjectPool<String, String, E> pool;
-        private final String key;
+    static class WaitingTestThread<K, E extends Exception> extends Thread {
+        private final KeyedObjectPool<K, String, E> pool;
+        private final K key;
         private final long pause;
         private Throwable thrown;
 
@@ -467,7 +499,7 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
         private long endedMillis;
         private String objectId;
 
-        WaitingTestThread(final KeyedObjectPool<String, String, E> pool, final String key, final long pause) {
+        WaitingTestThread(final KeyedObjectPool<K, String, E> pool, final K key, final long pause) {
             this.pool = pool;
             this.key = key;
             this.pause = pause;
@@ -1746,12 +1778,12 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
             pool.setMaxTotalPerKey(2);
             pool.setMaxWait(Duration.ofMillis(500));
             // Borrow an instance and hold if for 5 seconds
-            final WaitingTestThread<TestException> thread1 = new WaitingTestThread<>(pool, "one", 5000);
+            final WaitingTestThread<String, TestException> thread1 = new WaitingTestThread<>(pool, "one", 5000);
             thread1.start();
             // Borrow another instance
             final String obj = pool.borrowObject("one");
             // Launch another thread - will block, but fail in 500 ms
-            final WaitingTestThread<TestException> thread2 = new WaitingTestThread<>(pool, "one", 100);
+            final WaitingTestThread<String, TestException> thread2 = new WaitingTestThread<>(pool, "one", 100);
             thread2.start();
             // Invalidate the object borrowed by this thread - should allow thread2 to create
             Thread.sleep(20);
@@ -1893,9 +1925,9 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
         gkoPool.setMaxWait(Duration.ofMillis(3000));  // Really a timeout for the test
 
         // Check out and briefly hold 3 "1"s
-        final WaitingTestThread<TestException> t1 = new WaitingTestThread<>(gkoPool, "1", 100);
-        final WaitingTestThread<TestException> t2 = new WaitingTestThread<>(gkoPool, "1", 100);
-        final WaitingTestThread<TestException> t3 = new WaitingTestThread<>(gkoPool, "1", 100);
+        final WaitingTestThread<String, TestException> t1 = new WaitingTestThread<>(gkoPool, "1", 100);
+        final WaitingTestThread<String, TestException> t2 = new WaitingTestThread<>(gkoPool, "1", 100);
+        final WaitingTestThread<String, TestException> t3 = new WaitingTestThread<>(gkoPool, "1", 100);
         t1.start();
         t2.start();
         t3.start();
@@ -2179,16 +2211,16 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
         gkoPool.setMaxWait(Duration.ofMillis(maxWait));
         gkoPool.setMaxTotalPerKey(threadsPerKey);
         // Create enough threads so half the threads will have to wait
-        final WaitingTestThread<TestException>[] wtt = new WaitingTestThread[keyCount * threadsPerKey * 2];
+        final WaitingTestThread<String, TestException>[] wtt = new WaitingTestThread[keyCount * threadsPerKey * 2];
         for (int i = 0; i < wtt.length; i++) {
             wtt[i] = new WaitingTestThread<>(gkoPool, Integer.toString(i % keyCount), holdTime);
         }
         final long originMillis = System.currentTimeMillis() - 1000;
-        for (final WaitingTestThread<TestException> element : wtt) {
+        for (final WaitingTestThread<String, TestException> element : wtt) {
             element.start();
         }
         int failed = 0;
-        for (final WaitingTestThread<TestException> element : wtt) {
+        for (final WaitingTestThread<String, TestException> element : wtt) {
             element.join();
             if (element.thrown != null) {
                 failed++;
@@ -2203,7 +2235,7 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
                     " Threads: " + wtt.length +
                     " Failed: " + failed
                     );
-            for (final WaitingTestThread<TestException> wt : wtt) {
+            for (final WaitingTestThread<String, TestException> wt : wtt) {
                 System.out.println(
                         "Preborrow: " + (wt.preBorrowMillis - originMillis) +
                         " Postborrow: " + (wt.postBorrowMillis != 0 ? wt.postBorrowMillis - originMillis : -1) +
@@ -2655,10 +2687,10 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
             pool.setTestOnReturn(true);
             pool.setTestOnBorrow(false);
             // Borrow an instance and hold if for 5 seconds
-            final WaitingTestThread<TestException> thread1 = new WaitingTestThread<>(pool, "one", 5000);
+            final WaitingTestThread<String, TestException> thread1 = new WaitingTestThread<>(pool, "one", 5000);
             thread1.start();
             // Borrow another instance and return it after 500 ms (validation will fail)
-            final WaitingTestThread<TestException> thread2 = new WaitingTestThread<>(pool, "one", 500);
+            final WaitingTestThread<String, TestException> thread2 = new WaitingTestThread<>(pool, "one", 500);
             thread2.start();
             Thread.sleep(50);
             // Try to borrow an object
@@ -2712,7 +2744,7 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
         assertNotNull(obj1);
 
         // Create a separate thread to try and borrow another object
-        final WaitingTestThread<TestException> wtt = new WaitingTestThread<>(gkoPool, "a", 200);
+        final WaitingTestThread<String, TestException> wtt = new WaitingTestThread<>(gkoPool, "a", 200);
         wtt.start();
         // Give wtt time to start
         Thread.sleep(200);
@@ -2725,6 +2757,356 @@ class TestGenericKeyedObjectPool extends AbstractTestKeyedObjectPool {
 
         // Check thread was interrupted
         assertTrue(wtt.thrown instanceof InterruptedException);
+    }
+
+    /**
+     * Waits until the pool reports the expected number of waiters, or the
+     * timeout elapses. This provides a deterministic barrier for tests that
+     * need to ensure that helper threads have actually started waiting before
+     * making assertions.
+     *
+     * @param pool          the pool to query
+     * @param expected      the expected waiter count
+     * @param timeoutMillis the maximum time to wait
+     * @throws InterruptedException if the current thread is interrupted
+     */
+    private void awaitWaiters(final GenericKeyedObjectPool<?, ?, ?> pool, final int expected,
+            final long timeoutMillis) throws InterruptedException {
+        final long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (pool.getNumWaiters() == expected) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertEquals(expected, pool.getNumWaiters(), "waiter count did not reach expected value");
+    }
+
+    /**
+     * Waits until the pool reports the expected number of waiters, or the
+     * timeout elapses. This provides a deterministic barrier for tests that
+     * need to ensure that helper threads have actually started waiting before
+     * making assertions.
+     *
+     * @param expected      the expected waiter count
+     * @param timeoutMillis the maximum time to wait
+     * @throws InterruptedException if the current thread is interrupted
+     */
+    private void awaitWaiters(final int expected, final long timeoutMillis) throws InterruptedException {
+        awaitWaiters(gkoPool, expected, timeoutMillis);
+    }
+
+    /**
+     * Verifies the default value and configuration plumbing for the
+     * {@code maxWaitersPerKey} attribute.
+     */
+    @Test
+    void testMaxWaitersPerKeyConfig() {
+        try (GenericKeyedObjectPool<String, String, TestException> pool =
+                new GenericKeyedObjectPool<>(new SimpleFactory<String>())) {
+            // Default is unlimited, preserving the pre-existing behavior.
+            assertEquals(GenericKeyedObjectPoolConfig.DEFAULT_MAX_WAITERS_PER_KEY, pool.getMaxWaitersPerKey());
+            assertEquals(-1, pool.getMaxWaitersPerKey());
+
+            pool.setMaxWaitersPerKey(3);
+            assertEquals(3, pool.getMaxWaitersPerKey());
+        }
+
+        final GenericKeyedObjectPoolConfig<String> config = new GenericKeyedObjectPoolConfig<>();
+        config.setMaxWaitersPerKey(5);
+        try (GenericKeyedObjectPool<String, String, TestException> pool =
+                new GenericKeyedObjectPool<>(new SimpleFactory<String>(), config)) {
+            assertEquals(5, pool.getMaxWaitersPerKey());
+        }
+    }
+
+    /**
+     * Verifies that a per-key waiter limit of zero rejects every attempt to
+     * wait (fail-fast) without invoking the factory.
+     */
+    @Test
+    void testMaxWaitersPerKeyZero() throws Exception {
+        gkoPool.setMaxTotalPerKey(1);
+        gkoPool.setMaxWaitersPerKey(0);
+        gkoPool.setMaxWait(Duration.ofMillis(5000));
+
+        gkoPool.borrowObject("a");
+        assertEquals(1, gkoPool.getCreatedCount());
+
+        // No waiting is allowed: the attempt is rejected immediately.
+        assertThrows(NoSuchElementException.class, () -> gkoPool.borrowObject("a"));
+        // The rejected attempt must not have created an object.
+        assertEquals(1, gkoPool.getCreatedCount());
+        assertEquals(0, gkoPool.getNumWaiters());
+    }
+
+    /**
+     * Acceptance: when the wait quota for key A is full, key B can still
+     * queue. A hot key must not exhaust the waiting capacity of other keys.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testWaiterLimitPerKeyIsolation() throws Exception {
+        gkoPool.setMaxTotalPerKey(1);
+        gkoPool.setMaxWaitersPerKey(1);
+        gkoPool.setMaxWait(Duration.ofMillis(5000));
+
+        // Exhaust both keys; the main thread holds the only instances.
+        final String objA = gkoPool.borrowObject("a");
+        final String objB = gkoPool.borrowObject("b");
+
+        // First waiter on key A occupies the per-key quota.
+        final WaitingTestThread<String, TestException> waiterA = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiterA.start();
+        awaitWaiters(1, 2000);
+
+        // Key B can still queue even though A's quota is full.
+        final WaitingTestThread<String, TestException> waiterB = new WaitingTestThread<>(gkoPool, "b", 5000);
+        waiterB.start();
+        awaitWaiters(2, 2000);
+
+        // A further waiter on A is rejected (A's quota is full), without
+        // affecting B's ability to wait.
+        assertThrows(NoSuchElementException.class, () -> gkoPool.borrowObject("a"));
+        assertEquals(2, gkoPool.getNumWaiters());
+        assertTrue(waiterA.isAlive());
+        assertTrue(waiterB.isAlive());
+
+        // Returning objects wakes the correct key's waiter.
+        gkoPool.returnObject("a", objA);
+        gkoPool.returnObject("b", objB);
+        while (waiterA.thrown == null && waiterB.thrown == null && (waiterA.isAlive() || waiterB.isAlive())) {
+            Thread.sleep(10);
+        }
+        assertNull(waiterA.thrown);
+        assertNull(waiterB.thrown);
+        assertNotNull(waiterA.objectId);
+        assertNotNull(waiterB.objectId);
+    }
+
+    /**
+     * Acceptance: canceling a wait (timeout) removes the waiter's ticket so the
+     * quota is freed for another waiter.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testCancelWaitRemovesTicket() throws Exception {
+        gkoPool.setMaxTotalPerKey(1);
+        gkoPool.setMaxWaitersPerKey(1);
+        gkoPool.setMaxWait(Duration.ofMillis(200));
+
+        gkoPool.borrowObject("a");
+
+        // First waiter occupies the quota.
+        final WaitingTestThread<String, TestException> waiter1 = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter1.start();
+        awaitWaiters(1, 2000);
+
+        // Quota is full: another waiter is rejected.
+        assertThrows(NoSuchElementException.class, () -> gkoPool.borrowObject("a"));
+
+        // Wait for the first waiter to time out and release its ticket.
+        while (waiter1.thrown == null) {
+            Thread.sleep(10);
+        }
+        assertTrue(waiter1.thrown instanceof NoSuchElementException);
+        assertEquals(0, gkoPool.getNumWaiters());
+
+        // The quota is now free: a new waiter can queue.
+        final WaitingTestThread<String, TestException> waiter2 = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter2.start();
+        awaitWaiters(1, 2000);
+        assertTrue(waiter2.isAlive());
+        assertEquals(1, gkoPool.getNumWaiters());
+    }
+
+    /**
+     * Acceptance: the number of objects created is consistent with the number
+     * actually borrowed; a rejected waiter never triggers a factory call.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testCreateCountMatchesBorrows() throws Exception {
+        gkoPool.setMaxTotalPerKey(1);
+        gkoPool.setMaxWaitersPerKey(1);
+        gkoPool.setMaxWait(Duration.ofMillis(5000));
+
+        final String obj = gkoPool.borrowObject("a");
+        assertEquals(1, gkoPool.getCreatedCount());
+
+        // A waiting thread does not create any object.
+        final WaitingTestThread<String, TestException> waiter = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter.start();
+        awaitWaiters(1, 2000);
+        assertEquals(1, gkoPool.getCreatedCount());
+
+        // A rejected waiter does not create any object.
+        assertThrows(NoSuchElementException.class, () -> gkoPool.borrowObject("a"));
+        assertEquals(1, gkoPool.getCreatedCount());
+
+        // Returning the borrowed object lets the waiter borrow it; no new
+        // object is created.
+        gkoPool.returnObject("a", obj);
+        while (waiter.thrown == null && waiter.isAlive()) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, gkoPool.getCreatedCount());
+        assertNotNull(waiter.objectId);
+    }
+
+    /**
+     * Acceptance: two keys that are {@link EquatableKey#equals(Object) equal}
+     * merge into the same keyed sub-pool and therefore share the same per-key
+     * waiter quota.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testEqualKeysShareWaiterQuota() throws Exception {
+        try (GenericKeyedObjectPool<EquatableKey, String, TestException> pool =
+                new GenericKeyedObjectPool<>(new SimpleFactory<EquatableKey>())) {
+            pool.setMaxTotalPerKey(1);
+            pool.setMaxWaitersPerKey(1);
+            pool.setMaxWait(Duration.ofMillis(5000));
+
+            final EquatableKey key1 = new EquatableKey(1);
+            final EquatableKey key2 = new EquatableKey(1); // equal to key1
+            final EquatableKey key3 = new EquatableKey(1); // equal to key1
+
+            pool.borrowObject(key1);
+
+            // A waiter under an equal key occupies the shared quota.
+            final WaitingTestThread<EquatableKey, TestException> waiter = new WaitingTestThread<>(pool, key2, 5000);
+            waiter.start();
+            awaitWaiters(pool, 1, 2000);
+
+            // A further waiter under another equal key is rejected.
+            assertThrows(NoSuchElementException.class, () -> pool.borrowObject(key3));
+            assertEquals(1, pool.getNumWaiters());
+        }
+    }
+
+    /**
+     * Acceptance: when a wait times out, unborrowed (idle) objects are not
+     * destroyed.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testTimeoutDoesNotDestroyUnborrowedObjects() throws Exception {
+        gkoPool.setMaxTotalPerKey(2);
+        gkoPool.setMaxTotal(3);
+        gkoPool.setMaxWaitersPerKey(2);
+        gkoPool.setMaxWait(Duration.ofMillis(150));
+
+        // Pre-load an idle object for key "a".
+        gkoPool.addObject("a");
+        final String objA1 = gkoPool.borrowObject("a");
+        final String objA2 = gkoPool.borrowObject("a");
+        assertEquals(2, gkoPool.getNumActive("a"));
+
+        // Two waiters queue on "a".
+        final WaitingTestThread<String, TestException> waiter1 = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter1.start();
+        final WaitingTestThread<String, TestException> waiter2 = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter2.start();
+        awaitWaiters(2, 2000);
+
+        // An idle object under another key must survive the timeout on "a".
+        final String objB = gkoPool.borrowObject("b");
+        gkoPool.returnObject("b", objB);
+        assertEquals(1, gkoPool.getNumIdle());
+
+        // Let the waiters time out.
+        while (waiter1.thrown == null || waiter2.thrown == null) {
+            Thread.sleep(10);
+        }
+        assertTrue(waiter1.thrown instanceof NoSuchElementException);
+        assertTrue(waiter2.thrown instanceof NoSuchElementException);
+
+        // The unborrowed idle object and the active objects are all intact.
+        assertEquals(1, gkoPool.getNumIdle());
+        assertEquals(2, gkoPool.getNumActive("a"));
+        assertEquals(0, gkoPool.getNumWaiters());
+
+        // The idle object is still borrowable.
+        assertNotNull(gkoPool.borrowObject("b"));
+        // Return the active objects; they can be borrowed again.
+        gkoPool.returnObject("a", objA1);
+        gkoPool.returnObject("a", objA2);
+        assertEquals(2, gkoPool.getNumIdle("a"));
+        assertNotNull(gkoPool.borrowObject("a"));
+        assertNotNull(gkoPool.borrowObject("a"));
+    }
+
+    /**
+     * Acceptance: rejecting a waiter that would exceed the per-key quota does
+     * not destroy any object.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testRejectedWaiterDoesNotDestroyObjects() throws Exception {
+        gkoPool.setMaxTotalPerKey(2);
+        gkoPool.setMaxTotal(2);
+        gkoPool.setMaxWaitersPerKey(1);
+        gkoPool.setMaxWait(Duration.ofMillis(5000));
+
+        gkoPool.addObject("a");
+        final String obj1 = gkoPool.borrowObject("a");
+        final String obj2 = gkoPool.borrowObject("a");
+        assertEquals(2, gkoPool.getNumActive("a"));
+
+        // First waiter occupies the quota.
+        final WaitingTestThread<String, TestException> waiter = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiter.start();
+        awaitWaiters(1, 2000);
+
+        // Second waiter is rejected.
+        assertThrows(NoSuchElementException.class, () -> gkoPool.borrowObject("a"));
+
+        // No object was destroyed by the rejection.
+        assertEquals(2, gkoPool.getNumActive("a"));
+        assertEquals(0, gkoPool.getNumIdle("a"));
+
+        // Returning the borrowed objects lets the waiter borrow one of them.
+        gkoPool.returnObject("a", obj1);
+        gkoPool.returnObject("a", obj2);
+        while (waiter.thrown == null && waiter.isAlive()) {
+            Thread.sleep(10);
+        }
+        assertNotNull(waiter.objectId);
+        assertEquals(2, gkoPool.getNumActive("a") + gkoPool.getNumIdle("a"));
+    }
+
+    /**
+     * Acceptance: the total waiter count is consistent with the sum of the
+     * per-key waiter counts.
+     */
+    @Test
+    @Timeout(value = 10_000, unit = TimeUnit.MILLISECONDS)
+    void testWaiterStatsConsistent() throws Exception {
+        gkoPool.setMaxTotalPerKey(1);
+        gkoPool.setMaxTotal(2);
+        gkoPool.setMaxWaitersPerKey(2);
+        gkoPool.setMaxWait(Duration.ofMillis(5000));
+
+        gkoPool.borrowObject("a");
+        gkoPool.borrowObject("b");
+
+        final WaitingTestThread<String, TestException> waiterA = new WaitingTestThread<>(gkoPool, "a", 5000);
+        waiterA.start();
+        final WaitingTestThread<String, TestException> waiterB = new WaitingTestThread<>(gkoPool, "b", 5000);
+        waiterB.start();
+        awaitWaiters(2, 2000);
+
+        final int total = gkoPool.getNumWaiters();
+        final Map<String, Integer> byKey = gkoPool.getNumWaitersByKey();
+        int sum = 0;
+        for (final Integer count : byKey.values()) {
+            sum += count.intValue();
+        }
+        assertEquals(total, sum);
+        assertEquals(2, total);
+        assertEquals(Integer.valueOf(1), byKey.get("a"));
+        assertEquals(Integer.valueOf(1), byKey.get("b"));
     }
 
 }
