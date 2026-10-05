@@ -137,6 +137,14 @@ public interface GenericKeyedObjectPoolMXBean<K> {
     int getMaxTotalPerKey();
 
     /**
+     * See {@link GenericKeyedObjectPool#getMaxWaitersPerKey()}.
+     *
+     * @return See {@link GenericKeyedObjectPool#getMaxWaitersPerKey()}.
+     * @since 3.0.0
+     */
+    int getMaxWaitersPerKey();
+
+    /**
      * See {@link GenericKeyedObjectPool#getMaxWaitDuration()}.
      *
      * @return See {@link GenericKeyedObjectPool#getMaxWaitDuration()}.

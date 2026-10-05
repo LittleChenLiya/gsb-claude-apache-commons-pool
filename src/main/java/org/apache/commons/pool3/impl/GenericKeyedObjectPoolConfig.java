@@ -58,6 +58,14 @@ public class GenericKeyedObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
      */
     public static final int DEFAULT_MAX_IDLE_PER_KEY = 8;
 
+    /**
+     * The default value for the {@code maxWaitersPerKey} configuration attribute.
+     *
+     * @see GenericKeyedObjectPool#getMaxWaitersPerKey()
+     * @since 3.0.0
+     */
+    public static final int DEFAULT_MAX_WAITERS_PER_KEY = -1;
+
     private int minIdlePerKey = DEFAULT_MIN_IDLE_PER_KEY;
 
     private int maxIdlePerKey = DEFAULT_MAX_IDLE_PER_KEY;
@@ -65,6 +73,8 @@ public class GenericKeyedObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     private int maxTotalPerKey = DEFAULT_MAX_TOTAL_PER_KEY;
 
     private int maxTotal = DEFAULT_MAX_TOTAL;
+
+    private int maxWaitersPerKey = DEFAULT_MAX_WAITERS_PER_KEY;
 
     /**
      * Constructs a new configuration with default settings.
@@ -122,6 +132,20 @@ public class GenericKeyedObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     }
 
     /**
+     * Gets the value for the {@code maxWaitersPerKey} configuration attribute
+     * for pools created with this configuration instance.
+     *
+     * @return  The current setting of {@code maxWaitersPerKey} for this
+     *          configuration instance
+     *
+     * @see GenericKeyedObjectPool#getMaxWaitersPerKey()
+     * @since 3.0.0
+     */
+    public int getMaxWaitersPerKey() {
+        return maxWaitersPerKey;
+    }
+
+    /**
      * Gets the value for the {@code minIdlePerKey} configuration attribute
      * for pools created with this configuration instance.
      *
@@ -174,6 +198,20 @@ public class GenericKeyedObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     }
 
     /**
+     * Sets the value for the {@code maxWaitersPerKey} configuration attribute for
+     * pools created with this configuration instance.
+     *
+     * @param maxWaitersPerKey The new setting of {@code maxWaitersPerKey}
+     *        for this configuration instance
+     *
+     * @see GenericKeyedObjectPool#setMaxWaitersPerKey(int)
+     * @since 3.0.0
+     */
+    public void setMaxWaitersPerKey(final int maxWaitersPerKey) {
+        this.maxWaitersPerKey = maxWaitersPerKey;
+    }
+
+    /**
      * Sets the value for the {@code minIdlePerKey} configuration attribute for
      * pools created with this configuration instance.
      *
@@ -197,5 +235,7 @@ public class GenericKeyedObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
         builder.append(maxTotalPerKey);
         builder.append(", maxTotal=");
         builder.append(maxTotal);
+        builder.append(", maxWaitersPerKey=");
+        builder.append(maxWaitersPerKey);
     }
 }

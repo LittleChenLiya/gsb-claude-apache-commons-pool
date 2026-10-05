@@ -80,6 +80,20 @@ import org.apache.commons.pool3.UsageTracking;
  * block. See POOL-125 and DBCP-44 for more information.
  * </p>
  * <p>
+ * In addition to the limits on the number of pooled instances
+ * ({@link #getMaxTotalPerKey() maxTotalPerKey} and {@link #getMaxTotal()
+ * maxTotal}), an explicit limit on the number of threads allowed to wait for
+ * an instance under a single key may be configured via
+ * {@link #setMaxWaitersPerKey(int)}. This prevents a single hot key from
+ * exhausting the wait ("queue") capacity of the pool: once the per-key wait
+ * limit is reached, additional borrowers for that key are rejected immediately
+ * with a {@code NoSuchElementException} - before any attempt to create a new
+ * instance via the factory - while borrowers for other keys may still queue.
+ * Key identity follows {@code equals()} / {@code hashCode()}, so distinct but
+ * equal keys share a single sub-pool and a single wait limit. The default
+ * value of {@code -1} means no limit, preserving the historical behavior.
+ * </p>
+ * <p>
  * This class is intended to be thread-safe.
  * </p>
  *
@@ -125,6 +139,15 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
          */
         private final AtomicLong numInterested = new AtomicLong();
 
+        /*
+         * Number of threads currently holding a wait ticket for this key,
+         * i.e. threads parked (or about to park) waiting for an idle instance
+         * to become available under this key. Tickets are keyed by identity of
+         * the sub-pool (this deque) so a hot key can only exhaust its own
+         * allocation of wait slots, never the slots of other keys.
+         */
+        private final AtomicInteger numWaiters = new AtomicInteger();
+
         /**
          * Constructs a new ObjectDeque with the given fairness policy.
          *
@@ -133,6 +156,36 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
          */
         ObjectDeque(final boolean fairness) {
             idleObjects = new LinkedBlockingDeque<>(fairness);
+        }
+
+        /**
+         * Attempts to acquire a wait ticket for this key. A ticket entitles the
+         * holder to park waiting for an idle instance under this key.
+         *
+         * @param maxWaitersPerKey the maximum number of concurrent waiters
+         *        permitted for this key; a negative value means no limit
+         * @return {@code true} if a ticket was acquired, {@code false} if the
+         *         per-key wait limit has already been reached
+         */
+        boolean acquireWaitTicket(final int maxWaitersPerKey) {
+            int current;
+            do {
+                current = numWaiters.get();
+                if (maxWaitersPerKey > -1 && current >= maxWaitersPerKey) {
+                    return false;
+                }
+            } while (!numWaiters.compareAndSet(current, current + 1));
+            return true;
+        }
+
+        /**
+         * Releases a wait ticket previously obtained via
+         * {@link #acquireWaitTicket(int)}. Must be called exactly once for each
+         * successfully acquired ticket, including when the wait is cancelled
+         * (timeout or interrupt), so a cancelled wait never occupies a slot.
+         */
+        void releaseWaitTicket() {
+            numWaiters.decrementAndGet();
         }
 
         /**
@@ -183,6 +236,8 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
             builder.append(allObjects);
             builder.append(", numInterested=");
             builder.append(numInterested);
+            builder.append(", numWaiters=");
+            builder.append(numWaiters);
             builder.append("]");
             return builder.toString();
         }
@@ -203,6 +258,9 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
 
     private volatile int maxTotalPerKey =
             GenericKeyedObjectPoolConfig.DEFAULT_MAX_TOTAL_PER_KEY;
+
+    private volatile int maxWaitersPerKey =
+            GenericKeyedObjectPoolConfig.DEFAULT_MAX_WAITERS_PER_KEY;
 
     private final KeyedPooledObjectFactory<K, T, E> factory;
 
@@ -407,6 +465,17 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
      * "fairness" algorithm has been implemented to ensure that threads receive
      * available instances in request arrival order.
      * </p>
+     * <p>
+     * If {@link #getMaxWaitersPerKey() maxWaitersPerKey} is set to a
+     * non-negative value, the number of threads that may be simultaneously
+     * blocked waiting for an instance under a single key is limited. When the
+     * limit for the requested key has been reached, this method throws a
+     * {@code NoSuchElementException} immediately, before any further attempt
+     * to create an instance using the factory. Threads waiting for other keys
+     * are unaffected, so a single hot key cannot exhaust the wait capacity of
+     * the entire pool. A thread that stops waiting - because it obtained an
+     * instance, timed out or was interrupted - always releases its wait slot.
+     * </p>
      *
      * @param key pool key
      * @param borrowMaxWaitMillis The time to wait in milliseconds for an object
@@ -450,12 +519,27 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
                 }
                 if (blockWhenExhausted) {
                     if (PooledObject.isNull(p)) {
+                        // The sub-pool is exhausted and this thread is about to
+                        // park. Enforce the per-key wait limit before blocking
+                        // (and before any further factory.create attempt in the
+                        // next loop iteration) so that a hot key cannot exhaust
+                        // the wait capacity available to other keys.
+                        final int maxWaitersPerKeySave = getMaxWaitersPerKey();
+                        if (!objectDeque.acquireWaitTicket(maxWaitersPerKeySave)) {
+                            throw new NoSuchElementException(appendStats(
+                                    "Too many waiters for key, maxWaitersPerKey=" + maxWaitersPerKeySave));
+                        }
                         try {
                             p = borrowMaxWaitMillis < 0 ? objectDeque.getIdleObjects().takeFirst() :
                                 objectDeque.getIdleObjects().pollFirst(borrowMaxWaitMillis, TimeUnit.MILLISECONDS);
                         } catch (final InterruptedException e) {
                             Thread.currentThread().interrupt();
                             throw cast(e);
+                        } finally {
+                            // Whether the wait succeeded, timed out or was
+                            // cancelled by an interrupt, this thread's ticket
+                            // is removed so it no longer occupies a wait slot.
+                            objectDeque.releaseWaitTicket();
                         }
                     }
                     if (PooledObject.isNull(p)) {
@@ -1163,6 +1247,36 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
     }
 
     /**
+     * Gets the limit on the number of threads that may be simultaneously
+     * blocked in {@link #borrowObject(Object)} waiting for an instance to
+     * become available under a single key. A negative value (the default)
+     * indicates no limit, in which case any number of threads may queue for
+     * the same key.
+     * <p>
+     * This limit is enforced per key, using {@code equals()} / {@code hashCode()}
+     * key identity (keys that are equal share a sub-pool and therefore share a
+     * single wait limit). It applies in addition to - and independently of -
+     * the instance limits {@link #getMaxTotalPerKey() maxTotalPerKey} and
+     * {@link #getMaxTotal() maxTotal}: it bounds the number of <em>waiting
+     * borrowers</em>, not the number of objects. When a borrow request would
+     * have to wait but the wait slots for its key are all occupied, the
+     * request is rejected immediately with a {@code NoSuchElementException},
+     * before any object creation is attempted via the factory. A waiting
+     * thread that finishes waiting for any reason (success, timeout or
+     * interrupt) releases its slot, and an instance returned to the pool
+     * wakes up a thread waiting for the same key.
+     * </p>
+     *
+     * @return The limit on the number of waiting borrowers per key, or a
+     *         negative value if there is no limit
+     * @see #setMaxWaitersPerKey
+     * @since 3.0.0
+     */
+    public int getMaxWaitersPerKey() {
+        return maxWaitersPerKey;
+    }
+
+    /**
      * Gets the target for the minimum number of idle objects to maintain in
      * each of the keyed sub-pools. This setting only has an effect if it is
      * positive and {@link #getDurationBetweenEvictionRuns()} is greater than
@@ -1271,8 +1385,8 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
     String getStatsString() {
         // Simply listed in AB order.
         return super.getStatsString() +
-                String.format(", fairness=%s, maxIdlePerKey%,d, maxTotalPerKey=%,d, minIdlePerKey=%,d, numTotal=%,d",
-                        fairness, maxIdlePerKey, maxTotalPerKey, minIdlePerKey, numTotal.get());
+                String.format(", fairness=%s, maxIdlePerKey%,d, maxTotalPerKey=%,d, minIdlePerKey=%,d, numTotal=%,d, maxWaitersPerKey=%,d",
+                        fairness, maxIdlePerKey, maxTotalPerKey, minIdlePerKey, numTotal.get(), maxWaitersPerKey);
     }
 
     /**
@@ -1609,6 +1723,7 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
         setMaxTotalPerKey(conf.getMaxTotalPerKey());
         setMaxTotal(conf.getMaxTotal());
         setMinIdlePerKey(conf.getMinIdlePerKey());
+        setMaxWaitersPerKey(conf.getMaxWaitersPerKey());
     }
 
     /**
@@ -1644,6 +1759,38 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
     }
 
     /**
+     * Sets the limit on the number of threads that may be simultaneously
+     * blocked in {@link #borrowObject(Object)} waiting for an instance to
+     * become available under a single key. A negative value (the default)
+     * means no limit.
+     * <p>
+     * Use a non-negative value to stop a single hot key from exhausting the
+     * wait ("queue") capacity of the pool: once {@code maxWaitersPerKey}
+     * threads are blocked waiting for a given key, further borrow requests
+     * for that key that would have to wait fail immediately with a
+     * {@code NoSuchElementException} - before any factory object creation is
+     * attempted - while requests for other keys may still queue. A value of
+     * {@code 0} means borrowers never wait: a borrow that finds no idle
+     * instance and cannot create one fails immediately.
+     * </p>
+     * <p>
+     * Wait slots are tracked per key using {@code equals()} / {@code hashCode()}
+     * identity and are released as soon as a thread stops waiting (on success,
+     * timeout or interruption), so a cancelled wait never occupies a slot.
+     * Returning an instance to the pool wakes a thread waiting for the same
+     * key.
+     * </p>
+     *
+     * @param maxWaitersPerKey The limit on the number of waiting borrowers
+     *        per key. Use a negative value for no limit.
+     * @see #getMaxWaitersPerKey
+     * @since 3.0.0
+     */
+    public void setMaxWaitersPerKey(final int maxWaitersPerKey) {
+        this.maxWaitersPerKey = maxWaitersPerKey;
+    }
+
+    /**
      * Sets the target for the minimum number of idle objects to maintain in
      * each of the keyed sub-pools. This setting only has an effect if it is
      * positive and {@link #getDurationBetweenEvictionRuns()} is greater than
@@ -1674,6 +1821,8 @@ public class GenericKeyedObjectPool<K, T, E extends Exception> extends BaseGener
         builder.append(minIdlePerKey);
         builder.append(", maxTotalPerKey=");
         builder.append(maxTotalPerKey);
+        builder.append(", maxWaitersPerKey=");
+        builder.append(maxWaitersPerKey);
         builder.append(", factory=");
         builder.append(factory);
         builder.append(", fairness=");

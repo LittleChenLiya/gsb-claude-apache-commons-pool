@@ -47,6 +47,7 @@ The <action> type attribute can be add,update,fix,remove.
   <body>
     <release version="3.0.0" date="YYYY-MM-DD" description="This is a feature and maintenance release (Java 8 or above).">
       <!-- ADD -->
+      <action type="add" dev="ggregory">Add maxWaitersPerKey to GenericKeyedObjectPool to limit the number of threads that may wait concurrently for an instance under a single key, so a hot key cannot exhaust the wait capacity of the whole pool. The default (-1) is unlimited and preserves the previous behavior.</action>
       <action type="add" dev="psteitz" issue="POOL-407">Add ReslientPooledObjectFactory to provide resilience against factory outages.</action>
       <action type="add" dev="ggregory" issue="POOL-415" due-to="Réda Housni Alaoui, Gary Gregory, Phil Steitz">Add an option to JdkProxySource allowing to unwrap UndeclaredThrowableException #261.</action>
       <action type="add" dev="ggregory" due-to="Gary Gregory">Add org.apache.commons.pool3.proxy.CglibProxySource.Builder.</action>
