@@ -111,6 +111,14 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     private final ConcurrentHashMap<IdentityWrapper<T>, PooledObject<T>> allObjects = new ConcurrentHashMap<>();
 
     /*
+     * The current borrow generation of each pooled object. The generation
+     * advances every time an object is borrowed, which invalidates any
+     * {@link BorrowVoucher} issued for an earlier borrow of the same object.
+     * Entries are removed when the pooled object is destroyed.
+     */
+    private final ConcurrentHashMap<PooledObject<T>, Long> borrowGenerations = new ConcurrentHashMap<>();
+
+    /*
      * TODO The references to _maxActive are from 1.x and need to be updated.
      *
      * The combined count of the currently created objects and those in the
@@ -370,6 +378,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
         }
         updateStatsBorrow(p, durationSince(startInstant));
+        borrowGenerations.merge(p, 1L, Long::sum);
         return p.getObject();
     }
 
@@ -423,6 +432,32 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      */
     public T borrowObject(final long borrowMaxWaitMillis) throws E {
         return borrowObject(Duration.ofMillis(borrowMaxWaitMillis));
+    }
+
+    /**
+     * Borrows an object from the pool and returns a {@link BorrowVoucher} for
+     * this specific borrow. The voucher wraps the borrowed object together with
+     * the object's current borrow generation and can be presented exactly once
+     * to {@link #returnVoucher(BorrowVoucher)} to return the object to this
+     * pool.
+     * <p>
+     * The borrow itself behaves exactly like {@link #borrowObject()}.
+     * </p>
+     *
+     * @return A voucher for this borrow, never null.
+     * @throws NoSuchElementException if an instance cannot be borrowed
+     * @throws E if an object instance cannot be borrowed due to an error
+     * @since 3.0.0
+     */
+    public BorrowVoucher<T> borrowVoucher() throws E {
+        final T object = borrowObject();
+        final PooledObject<T> p = getPooledObject(object);
+        final Long generation = PooledObject.nonNull(p) ? borrowGenerations.get(p) : null;
+        if (generation == null) {
+            // Cannot happen for an object just borrowed from this pool.
+            throw new IllegalStateException("Borrowed object not currently part of this pool");
+        }
+        return new BorrowVoucher<>(this, object, generation.longValue());
     }
 
     /**
@@ -609,6 +644,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
         toDestroy.invalidate();
         idleObjects.remove(toDestroy);
         allObjects.remove(IdentityWrapper.unwrap(toDestroy));
+        borrowGenerations.remove(toDestroy);
         try {
             factory.destroyObject(toDestroy, destroyMode);
         } finally {
@@ -1109,6 +1145,60 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
         }
         updateStatsReturn(activeTime);
+    }
+
+    /**
+     * Returns an object to the pool by presenting the {@link BorrowVoucher}
+     * that was issued for this specific borrow by
+     * {@link #borrowVoucher()}.
+     * <p>
+     * A voucher is accepted only if all of the following hold:
+     * </p>
+     * <ul>
+     * <li>it was issued by this pool;</li>
+     * <li>it has not been used to return an object before (single use);</li>
+     * <li>its object is still part of this pool; and</li>
+     * <li>its generation still matches the object's current borrow generation,
+     * i.e. the object has not been returned and borrowed again since the
+     * voucher was issued.</li>
+     * </ul>
+     * <p>
+     * Otherwise an {@link IllegalStateException} is thrown and the pool is left
+     * unchanged. In particular, a voucher issued for an earlier borrow of an
+     * object that has since been returned and re-borrowed is rejected.
+     * </p>
+     * <p>
+     * An accepted voucher is consumed and the object is returned exactly as by
+     * {@link #returnObject(Object)}: if {@link #getTestOnReturn() testOnReturn}
+     * is set and validation fails, the object is destroyed exactly once through
+     * the pool's normal destroy path.
+     * </p>
+     *
+     * @param voucher The voucher issued for the borrow being returned, not null.
+     * @throws IllegalStateException if the voucher was not issued by this pool,
+     *         has already been used, or is stale
+     * @since 3.0.0
+     */
+    public void returnVoucher(final BorrowVoucher<T> voucher) {
+        if (voucher == null) {
+            throw new NullPointerException("voucher");
+        }
+        if (voucher.getOwner() != this) {
+            throw new IllegalStateException("Voucher was not issued by this pool");
+        }
+        if (!voucher.markConsumed()) {
+            throw new IllegalStateException("Voucher has already been used to return an object");
+        }
+        final PooledObject<T> p = getPooledObject(voucher.getObject());
+        if (PooledObject.isNull(p)) {
+            throw new IllegalStateException("Returned object not currently part of this pool");
+        }
+        final Long currentGeneration = borrowGenerations.get(p);
+        if (currentGeneration == null || currentGeneration.longValue() != voucher.getGeneration()) {
+            throw new IllegalStateException(
+                    "Voucher is stale; the object has been returned and borrowed again since this voucher was issued");
+        }
+        returnObject(voucher.getObject());
     }
 
     /**
