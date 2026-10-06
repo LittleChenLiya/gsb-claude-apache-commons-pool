@@ -127,6 +127,18 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
     private final LinkedBlockingDeque<PooledObject<T>> idleObjects;
 
+    /*
+     * Issues a unique generation to each permit-based loan.
+     */
+    private final AtomicLong permitGeneration = new AtomicLong();
+
+    /*
+     * The current permit generation for each object currently borrowed via
+     * {@link #borrowObjectWithPermit()}. An entry only exists while the
+     * permit-based loan it belongs to is outstanding.
+     */
+    private final ConcurrentHashMap<IdentityWrapper<T>, Long> activePermits = new ConcurrentHashMap<>();
+
     /**
      * Creates a new {@code GenericObjectPool} using defaults from
      * {@link GenericObjectPoolConfig}.
@@ -426,6 +438,49 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     }
 
     /**
+     * Borrows an object from this pool and returns it wrapped in a
+     * generation-stamped {@link BorrowPermit}.
+     * <p>
+     * Equivalent to
+     * <code>{@link #borrowObjectWithPermit(Duration)
+     * borrowObjectWithPermit}({@link #getMaxWaitDuration()})</code>.
+     * </p>
+     *
+     * @return a permit identifying this loan of the borrowed object
+     * @throws NoSuchElementException if an instance cannot be borrowed
+     * @throws E if an object instance cannot be borrowed due to an error
+     * @since 3.0.0
+     */
+    public BorrowPermit<T> borrowObjectWithPermit() throws E {
+        return borrowObjectWithPermit(getMaxWaitDuration());
+    }
+
+    /**
+     * Borrows an object from this pool and returns it wrapped in a
+     * generation-stamped {@link BorrowPermit}.
+     * <p>
+     * The object is borrowed exactly as by {@link #borrowObject(Duration)}.
+     * The returned permit is the only credential accepted by
+     * {@link #returnObject(BorrowPermit)} for this loan, and it is accepted
+     * only once. Each new loan of the same object is issued a new generation,
+     * so permits from earlier loans become stale as soon as the object is
+     * returned.
+     * </p>
+     *
+     * @param maxWaitDuration The time to wait for an object to become available, not null.
+     * @return a permit identifying this loan of the borrowed object
+     * @throws NoSuchElementException if an instance cannot be borrowed
+     * @throws E if an object instance cannot be borrowed due to an error
+     * @since 3.0.0
+     */
+    public BorrowPermit<T> borrowObjectWithPermit(final Duration maxWaitDuration) throws E {
+        final T object = borrowObject(maxWaitDuration);
+        final long generation = permitGeneration.incrementAndGet();
+        activePermits.put(new IdentityWrapper<>(object), generation);
+        return new BorrowPermit<>(this, object, generation);
+    }
+
+    /**
      * Clears any objects sitting idle in the pool by removing them from the
      * idle instance pool and then invoking the configured
      * {@link PooledObjectFactory#destroyObject(PooledObject)} method on each
@@ -609,6 +664,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
         toDestroy.invalidate();
         idleObjects.remove(toDestroy);
         allObjects.remove(IdentityWrapper.unwrap(toDestroy));
+        activePermits.remove(IdentityWrapper.unwrap(toDestroy));
         try {
             factory.destroyObject(toDestroy, destroyMode);
         } finally {
@@ -1041,6 +1097,9 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             return; // Object was abandoned and removed
         }
 
+        // A plain return ends any outstanding permit-based loan of the object.
+        activePermits.remove(new IdentityWrapper<>(obj));
+
         markReturningState(p);
 
         final Duration activeTime = p.getActiveDuration();
@@ -1109,6 +1168,68 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
         }
         updateStatsReturn(activeTime);
+    }
+
+    /**
+     * Returns an object to this pool using the {@link BorrowPermit} issued by
+     * {@link #borrowObjectWithPermit()} for the object's current loan.
+     * <p>
+     * The permit is validated before the object is accepted: it must have been
+     * issued by this pool, it must carry the generation of this pool's current
+     * loan of the object, and it must not have been used before. A permit that
+     * passes validation is consumed and the object is returned exactly as by
+     * {@link #returnObject(Object)}.
+     * </p>
+     * <p>
+     * If validation fails - the permit is null, was issued by another pool, is
+     * stale because the object has been returned and borrowed again, or has
+     * already been used - the permit is rejected. If the object is still part
+     * of this pool, it is destroyed exactly once using the same destroy path
+     * as a failed {@code returnObject} (including the {@code ensureIdle}
+     * compensating create), and an {@link IllegalStateException} is thrown.
+     * Replaying a rejected permit destroys nothing further.
+     * </p>
+     *
+     * @param permit The permit issued for the current loan of the object to
+     *               return
+     * @throws IllegalStateException if the permit is not the valid, unused
+     *                               credential for this pool's current loan of
+     *                               the object
+     * @since 3.0.0
+     */
+    public void returnObject(final BorrowPermit<T> permit) {
+        if (permit == null || permit.getPool() != this) {
+            throw new IllegalStateException("Permit was not issued by this pool");
+        }
+        final T obj = permit.getObject();
+        final IdentityWrapper<T> key = new IdentityWrapper<>(obj);
+        final PooledObject<T> p = allObjects.get(key);
+        final Long currentGeneration = activePermits.get(key);
+        if (p == null || currentGeneration == null || currentGeneration.longValue() != permit.getGeneration()
+                || !permit.tryConsume()) {
+            // Validation failed: reject the permit. Destroy the pooled object
+            // exactly once via the existing destroy path if it is still part
+            // of this pool.
+            if (p != null) {
+                synchronized (p) {
+                    if (p.getState() != PooledObjectState.INVALID) {
+                        try {
+                            destroy(p, DestroyMode.NORMAL);
+                        } catch (final Exception e) {
+                            swallowException(e);
+                        }
+                    }
+                }
+                try {
+                    ensureIdle(1, false);
+                } catch (final Exception e) {
+                    swallowException(e);
+                }
+            }
+            throw new IllegalStateException("Permit is not valid for the current loan of the object from this pool");
+        }
+        activePermits.remove(key, permit.getGeneration());
+        returnObject(obj);
     }
 
     /**
