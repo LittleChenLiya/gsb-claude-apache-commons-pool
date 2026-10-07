@@ -127,6 +127,8 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
     private final LinkedBlockingDeque<PooledObject<T>> idleObjects;
 
+    private volatile BorrowWaitObserver borrowWaitObserver = BorrowWaitObserver.NOOP;
+
     /**
      * Creates a new {@code GenericObjectPool} using defaults from
      * {@link GenericObjectPoolConfig}.
@@ -309,13 +311,23 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
             if (blockWhenExhausted) {
                 if (PooledObject.isNull(p)) {
+                    final BorrowWaitObserver observer = borrowWaitObserver;
+                    final Instant waitStartInstant = Instant.now();
+                    notifyWaitStarted(observer, waitStartInstant, maxWaitDuration);
+                    BorrowWaitObserver.WaitEndReason waitEndReason = BorrowWaitObserver.WaitEndReason.TIMEOUT;
                     try {
                         remainingWaitDuration = maxWaitDuration.minus(durationSince(startInstant));
                         p = negativeDuration ? idleObjects.takeFirst() : idleObjects.pollFirst(maxWaitDuration);
+                        if (PooledObject.nonNull(p)) {
+                            waitEndReason = BorrowWaitObserver.WaitEndReason.ACQUIRED;
+                        }
                     } catch (final InterruptedException e) {
+                        waitEndReason = BorrowWaitObserver.WaitEndReason.INTERRUPTED;
                         // Don't surface exception type of internal locking mechanism.
                         Thread.currentThread().interrupt();
                         throw cast(e);
+                    } finally {
+                        notifyWaitEnded(observer, waitEndReason, waitStartInstant);
                     }
                 }
                 if (PooledObject.isNull(p)) {
@@ -622,6 +634,42 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     }
 
     /**
+     * Notifies the given observer that a borrow wait ended. Observer failures
+     * are swallowed so they never affect the outcome of a borrow.
+     *
+     * @param observer     the observer to notify, not null.
+     * @param reason       why the wait ended, not null.
+     * @param startInstant the instant at which the borrow request started, not null.
+     */
+    private void notifyWaitEnded(final BorrowWaitObserver observer, final BorrowWaitObserver.WaitEndReason reason,
+            final Instant startInstant) {
+        try {
+            observer.waitEnded(reason, startInstant, durationSince(startInstant));
+        } catch (final Throwable ignored) {
+            // Observer failures must not consume borrow capacity or change
+            // the outcome of a borrow.
+        }
+    }
+
+    /**
+     * Notifies the given observer that a borrow wait is about to start.
+     * Observer failures are swallowed so they never affect the outcome of a
+     * borrow.
+     *
+     * @param observer        the observer to notify, not null.
+     * @param startInstant    the instant at which the borrow request started, not null.
+     * @param maxWaitDuration the maximum wait duration for this borrow, not null.
+     */
+    private void notifyWaitStarted(final BorrowWaitObserver observer, final Instant startInstant, final Duration maxWaitDuration) {
+        try {
+            observer.waitStarted(startInstant, maxWaitDuration);
+        } catch (final Throwable ignored) {
+            // Observer failures must not consume borrow capacity or change
+            // the outcome of a borrow.
+        }
+    }
+
+    /**
      * Tries to ensure that {@code idleCount} idle instances exist in the pool.
      * <p>
      * Creates and adds idle instances until either {@link #getNumIdle()} reaches {@code idleCount}
@@ -787,6 +835,18 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
         if (ac != null && ac.getRemoveAbandonedOnMaintenance()) {
             removeAbandoned(ac);
         }
+    }
+
+    /**
+     * Gets the observer notified when a borrow request waits for an idle
+     * object.
+     *
+     * @return the current borrow wait observer, never null.
+     * @see #setBorrowWaitObserver(BorrowWaitObserver)
+     * @since 3.0.0
+     */
+    public BorrowWaitObserver getBorrowWaitObserver() {
+        return borrowWaitObserver;
     }
 
     /**
@@ -1109,6 +1169,20 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
         }
         updateStatsReturn(activeTime);
+    }
+
+    /**
+     * Sets the observer notified when a borrow request waits for an idle
+     * object. Exceptions thrown by the observer are swallowed and never
+     * affect the outcome of a borrow.
+     *
+     * @param borrowWaitObserver the observer to use, null resets to
+     *                           {@link BorrowWaitObserver#NOOP}.
+     * @see #getBorrowWaitObserver()
+     * @since 3.0.0
+     */
+    public void setBorrowWaitObserver(final BorrowWaitObserver borrowWaitObserver) {
+        this.borrowWaitObserver = borrowWaitObserver == null ? BorrowWaitObserver.NOOP : borrowWaitObserver;
     }
 
     /**
