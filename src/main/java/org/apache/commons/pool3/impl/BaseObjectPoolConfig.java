@@ -19,6 +19,7 @@ package org.apache.commons.pool3.impl;
 import java.time.Duration;
 
 import org.apache.commons.pool3.BaseObject;
+import org.apache.commons.pool3.DestroyObjectCallback;
 
 /**
  * Provides the implementation for the common attributes shared by the
@@ -234,6 +235,8 @@ public abstract class BaseObjectPoolConfig<T> extends BaseObject implements Clon
 
     private boolean collectDetailedStatistics = DEFAULT_COLLECT_DETAILED_STATISTICS;
 
+    private DestroyObjectCallback<T> destroyObjectCallback; // null default: disabled
+
     /**
      * Constructs a new instance.
      */
@@ -270,6 +273,18 @@ public abstract class BaseObjectPoolConfig<T> extends BaseObject implements Clon
      */
     public boolean getCollectDetailedStatistics() {
         return collectDetailedStatistics;
+    }
+
+    /**
+     * Gets the callback notified when a pool destroys a pooled object on the
+     * return or close path, or {@code null} if none is configured (the
+     * default), in which case pools behave exactly as before.
+     *
+     * @return the destroy object callback, or {@code null} if not configured
+     * @since 3.0.0
+     */
+    public DestroyObjectCallback<T> getDestroyObjectCallback() {
+        return destroyObjectCallback;
     }
 
     /**
@@ -544,6 +559,24 @@ public abstract class BaseObjectPoolConfig<T> extends BaseObject implements Clon
      */
     public void setCollectDetailedStatistics(final boolean collectDetailedStatistics) {
         this.collectDetailedStatistics = collectDetailedStatistics;
+    }
+
+    /**
+     * Sets the callback notified when a pool destroys a pooled object on the
+     * return or close path. Each pooled object is reported at most once, and
+     * exceptions thrown by the callback are swallowed so that destroy
+     * processing and pool accounting always complete.
+     * <p>
+     * The default is {@code null} (no callback), which preserves the
+     * previous behavior.
+     * </p>
+     *
+     * @param destroyObjectCallback the callback to notify, or {@code null} to
+     *        disable notifications
+     * @since 3.0.0
+     */
+    public void setDestroyObjectCallback(final DestroyObjectCallback<T> destroyObjectCallback) {
+        this.destroyObjectCallback = destroyObjectCallback;
     }
 
     /**

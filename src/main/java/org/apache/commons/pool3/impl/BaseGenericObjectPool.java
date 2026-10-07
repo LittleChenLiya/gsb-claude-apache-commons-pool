@@ -45,6 +45,7 @@ import javax.management.NotCompliantMBeanException;
 import javax.management.ObjectName;
 
 import org.apache.commons.pool3.BaseObject;
+import org.apache.commons.pool3.DestroyObjectCallback;
 import org.apache.commons.pool3.PooledObject;
 import org.apache.commons.pool3.PooledObjectState;
 import org.apache.commons.pool3.SwallowedExceptionListener;
@@ -410,6 +411,8 @@ public abstract class BaseGenericObjectPool<T, E extends Exception> extends Base
     private volatile SwallowedExceptionListener swallowedExceptionListener;
     private volatile boolean messageStatistics;
     private volatile boolean collectDetailedStatistics = BaseObjectPoolConfig.DEFAULT_COLLECT_DETAILED_STATISTICS;
+
+    private volatile DestroyObjectCallback<T> destroyObjectCallback; // null default: disabled
 
     /** Additional configuration properties for abandoned object tracking. */
     protected volatile AbandonedConfig abandonedConfig;
@@ -867,6 +870,18 @@ public abstract class BaseGenericObjectPool<T, E extends Exception> extends Base
     }
 
     /**
+     * Gets the callback notified when this pool destroys a pooled object on
+     * the return or close path, or {@code null} if none is configured (the
+     * default).
+     *
+     * @return the destroy object callback, or {@code null} if not configured
+     * @since 3.0.0
+     */
+    public DestroyObjectCallback<T> getDestroyObjectCallback() {
+        return destroyObjectCallback;
+    }
+
+    /**
      * Gets the minimum amount of time an object may sit idle in the pool
      * before it is eligible for eviction by the idle object evictor (if any -
      * see {@link #setDurationBetweenEvictionRuns(Duration)}). When non-positive,
@@ -1306,6 +1321,7 @@ public abstract class BaseGenericObjectPool<T, E extends Exception> extends Base
         }
         setEvictorShutdownTimeout(config.getEvictorShutdownTimeoutDuration());
         setCollectDetailedStatistics(config.getCollectDetailedStatistics());
+        setDestroyObjectCallback(config.getDestroyObjectCallback());
     }
 
     /**
@@ -1504,6 +1520,20 @@ public abstract class BaseGenericObjectPool<T, E extends Exception> extends Base
      */
     public void setCollectDetailedStatistics(final boolean collectDetailedStatistics) {
         this.collectDetailedStatistics = collectDetailedStatistics;
+    }
+
+    /**
+     * Sets the callback notified when this pool destroys a pooled object on
+     * the return or close path. Each pooled object is reported at most once,
+     * and exceptions thrown by the callback are swallowed so that destroy
+     * processing and pool accounting always complete.
+     *
+     * @param destroyObjectCallback the callback to notify, or {@code null} to
+     *        disable notifications (the default)
+     * @since 3.0.0
+     */
+    public void setDestroyObjectCallback(final DestroyObjectCallback<T> destroyObjectCallback) {
+        this.destroyObjectCallback = destroyObjectCallback;
     }
 
     /**

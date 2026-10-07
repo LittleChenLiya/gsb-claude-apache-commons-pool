@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import org.apache.commons.pool3.DestroyMode;
+import org.apache.commons.pool3.DestroyObjectCallback;
+import org.apache.commons.pool3.DestroyReason;
 import org.apache.commons.pool3.ObjectPool;
 import org.apache.commons.pool3.PoolUtils;
 import org.apache.commons.pool3.PooledObject;
@@ -445,11 +447,23 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      */
     @Override
     public void clear() {
+        clear(null);
+    }
+
+    /**
+     * Clears any objects sitting idle in the pool, reporting the given
+     * destroy reason to the configured
+     * {@link org.apache.commons.pool3.DestroyObjectCallback}, if any.
+     *
+     * @param destroyReason the reason to report, or {@code null} for no
+     *        notification
+     */
+    private void clear(final DestroyReason destroyReason) {
         PooledObject<T> p = idleObjects.poll();
 
         while (p != null) {
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, destroyReason);
             } catch (final Exception e) {
                 swallowException(e);
             }
@@ -483,7 +497,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
             closed = true;
             // This clear removes any idle objects
-            clear();
+            clear(DestroyReason.POOL_CLOSED);
 
             jmxUnregister();
 
@@ -606,14 +620,56 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      *                   cleanly
      */
     private void destroy(final PooledObject<T> toDestroy, final DestroyMode destroyMode) throws E {
+        destroy(toDestroy, destroyMode, null);
+    }
+
+    /**
+     * Destroys a wrapped pooled object.
+     *
+     * @param toDestroy The wrapped pooled object to destroy
+     * @param destroyMode DestroyMode context provided to the factory
+     * @param destroyReason Reason reported to the configured
+     *                      {@link org.apache.commons.pool3.DestroyObjectCallback},
+     *                      or {@code null} for no notification
+     * @throws E If the factory fails to destroy the pooled object
+     *                   cleanly
+     */
+    private void destroy(final PooledObject<T> toDestroy, final DestroyMode destroyMode, final DestroyReason destroyReason) throws E {
         toDestroy.invalidate();
         idleObjects.remove(toDestroy);
-        allObjects.remove(IdentityWrapper.unwrap(toDestroy));
+        // Guard ensuring each pooled object is reported at most once: the
+        // first (and only) removal of the object from allObjects wins.
+        final boolean firstDestroy = allObjects.remove(IdentityWrapper.unwrap(toDestroy)) != null;
         try {
             factory.destroyObject(toDestroy, destroyMode);
         } finally {
             destroyedCount.incrementAndGet();
             createCount.decrementAndGet();
+            if (firstDestroy) {
+                notifyDestroyed(toDestroy, destroyReason);
+            }
+        }
+    }
+
+    /**
+     * Notifies the configured
+     * {@link org.apache.commons.pool3.DestroyObjectCallback}, if any, that a
+     * pooled object has been destroyed. Exceptions thrown by the callback are
+     * swallowed so that pool accounting and destruction always complete.
+     *
+     * @param toDestroy The destroyed pooled object
+     * @param destroyReason The reason the object was destroyed, or
+     *                      {@code null} for no notification
+     */
+    private void notifyDestroyed(final PooledObject<T> toDestroy, final DestroyReason destroyReason) {
+        final DestroyObjectCallback<T> callback = getDestroyObjectCallback();
+        if (callback == null || destroyReason == null) {
+            return;
+        }
+        try {
+            callback.onDestroy(toDestroy.getObject(), destroyReason);
+        } catch (final Exception e) {
+            swallowException(e);
         }
     }
 
@@ -1047,7 +1103,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
         if (getTestOnReturn() && !factory.validateObject(p)) {
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, DestroyReason.RETURN_VALIDATION_FAILED);
             } catch (final Exception e) {
                 swallowException(e);
             }
@@ -1085,8 +1141,9 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
         final int maxIdleSave = getMaxIdle();
         if (isClosed() || maxIdleSave > -1 && maxIdleSave <= idleObjects.size()) {
+            final DestroyReason destroyReason = isClosed() ? DestroyReason.POOL_CLOSED : DestroyReason.MAX_IDLE_EXCEEDED;
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, destroyReason);
             } catch (final Exception e) {
                 swallowException(e);
             }
