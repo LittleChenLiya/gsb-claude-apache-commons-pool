@@ -16,6 +16,8 @@
  */
 package org.apache.commons.pool3.impl;
 
+import org.apache.commons.pool3.WaitObserver;
+
 /**
  * A simple structure encapsulating the configuration for a
  * {@link GenericObjectPool}.
@@ -56,6 +58,8 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     private int maxIdle = DEFAULT_MAX_IDLE;
 
     private int minIdle = DEFAULT_MIN_IDLE;
+
+    private WaitObserver waitObserver;
 
     /**
      * Constructs a new instance.
@@ -150,6 +154,30 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
      */
     public void setMinIdle(final int minIdle) {
         this.minIdle = minIdle;
+    }
+
+    /**
+     * Gets the observer notified when borrowers start and stop waiting for an
+     * idle object in pools created with this configuration instance.
+     *
+     * @return the wait observer, or {@code null} if none is configured.
+     * @see GenericObjectPool#getWaitObserver()
+     * @since 3.0
+     */
+    public WaitObserver getWaitObserver() {
+        return waitObserver;
+    }
+
+    /**
+     * Sets the observer notified when borrowers start and stop waiting for an
+     * idle object in pools created with this configuration instance.
+     *
+     * @param waitObserver the wait observer, or {@code null} for none.
+     * @see GenericObjectPool#setWaitObserver(WaitObserver)
+     * @since 3.0
+     */
+    public void setWaitObserver(final WaitObserver waitObserver) {
+        this.waitObserver = waitObserver;
     }
 
     @Override

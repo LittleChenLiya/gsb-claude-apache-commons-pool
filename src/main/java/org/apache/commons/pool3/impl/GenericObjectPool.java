@@ -34,6 +34,8 @@ import org.apache.commons.pool3.PooledObjectState;
 import org.apache.commons.pool3.SwallowedExceptionListener;
 import org.apache.commons.pool3.TrackedUse;
 import org.apache.commons.pool3.UsageTracking;
+import org.apache.commons.pool3.WaitEndReason;
+import org.apache.commons.pool3.WaitObserver;
 
 /**
  * A configurable {@link ObjectPool} implementation.
@@ -96,6 +98,8 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     private volatile int maxIdle = GenericObjectPoolConfig.DEFAULT_MAX_IDLE;
 
     private volatile int minIdle = GenericObjectPoolConfig.DEFAULT_MIN_IDLE;
+
+    private volatile WaitObserver waitObserver;
 
     private final PooledObjectFactory<T, E> factory;
 
@@ -309,13 +313,23 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             }
             if (blockWhenExhausted) {
                 if (PooledObject.isNull(p)) {
+                    final WaitObserver observer = waitObserver;
+                    final Instant waitStartInstant = Instant.now();
+                    notifyWaitStart(observer, waitStartInstant, maxWaitDuration);
+                    WaitEndReason waitEndReason = WaitEndReason.ACQUIRED;
                     try {
                         remainingWaitDuration = maxWaitDuration.minus(durationSince(startInstant));
                         p = negativeDuration ? idleObjects.takeFirst() : idleObjects.pollFirst(maxWaitDuration);
+                        if (PooledObject.isNull(p)) {
+                            waitEndReason = WaitEndReason.TIMED_OUT;
+                        }
                     } catch (final InterruptedException e) {
+                        waitEndReason = WaitEndReason.INTERRUPTED;
                         // Don't surface exception type of internal locking mechanism.
                         Thread.currentThread().interrupt();
                         throw cast(e);
+                    } finally {
+                        notifyWaitEnd(observer, waitEndReason, durationSince(waitStartInstant));
                     }
                 }
                 if (PooledObject.isNull(p)) {
@@ -622,6 +636,45 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     }
 
     /**
+     * Notifies the given observer, if any, that a wait for an idle object has
+     * ended. Exceptions thrown by the observer are swallowed so that a failing
+     * observer never changes the outcome of a borrow.
+     *
+     * @param observer     the observer, may be null.
+     * @param reason       why the wait ended.
+     * @param waitDuration the approximate duration of the wait.
+     */
+    private void notifyWaitEnd(final WaitObserver observer, final WaitEndReason reason, final Duration waitDuration) {
+        if (observer != null) {
+            try {
+                observer.onWaitEnd(reason, waitDuration);
+            } catch (final Exception e) {
+                swallowException(e);
+            }
+        }
+    }
+
+    /**
+     * Notifies the given observer, if any, that a borrower is about to block
+     * waiting for an idle object. Exceptions thrown by the observer are
+     * swallowed so that a failing observer never changes the outcome of a
+     * borrow.
+     *
+     * @param observer        the observer, may be null.
+     * @param startInstant    the instant at which the wait starts.
+     * @param maxWaitDuration the maximum duration the borrower will wait.
+     */
+    private void notifyWaitStart(final WaitObserver observer, final Instant startInstant, final Duration maxWaitDuration) {
+        if (observer != null) {
+            try {
+                observer.onWaitStart(startInstant, maxWaitDuration);
+            } catch (final Exception e) {
+                swallowException(e);
+            }
+        }
+    }
+
+    /**
      * Tries to ensure that {@code idleCount} idle instances exist in the pool.
      * <p>
      * Creates and adds idle instances until either {@link #getNumIdle()} reaches {@code idleCount}
@@ -865,6 +918,17 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     @Override
     public int getNumActive() {
         return allObjects.size() - idleObjects.size();
+    }
+
+    /**
+     * Gets the observer notified when borrowers start and stop waiting for an
+     * idle object.
+     *
+     * @return the wait observer, or {@code null} if none is configured.
+     * @since 3.0
+     */
+    public WaitObserver getWaitObserver() {
+        return waitObserver;
     }
 
     @Override
@@ -1122,6 +1186,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
         setMaxIdle(conf.getMaxIdle());
         setMinIdle(conf.getMinIdle());
         setMaxTotal(conf.getMaxTotal());
+        setWaitObserver(conf.getWaitObserver());
     }
 
     /**
@@ -1164,6 +1229,20 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      */
     public void setMinIdle(final int minIdle) {
         this.minIdle = minIdle;
+    }
+
+    /**
+     * Sets the observer notified when borrowers start and stop waiting for an
+     * idle object. Exceptions thrown by the observer are swallowed (and
+     * reported to the configured {@link SwallowedExceptionListener}, if any),
+     * so a failing observer never changes the outcome of a borrow.
+     *
+     * @param waitObserver the wait observer, or {@code null} to stop observing
+     *                     waits.
+     * @since 3.0
+     */
+    public void setWaitObserver(final WaitObserver waitObserver) {
+        this.waitObserver = waitObserver;
     }
 
     @Override
