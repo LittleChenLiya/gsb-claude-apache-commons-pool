@@ -16,6 +16,8 @@
  */
 package org.apache.commons.pool3.impl;
 
+import org.apache.commons.pool3.ObjectDestroyListener;
+
 /**
  * A simple structure encapsulating the configuration for a
  * {@link GenericObjectPool}.
@@ -56,6 +58,8 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     private int maxIdle = DEFAULT_MAX_IDLE;
 
     private int minIdle = DEFAULT_MIN_IDLE;
+
+    private ObjectDestroyListener<T> objectDestroyListener;
 
     /**
      * Constructs a new instance.
@@ -114,6 +118,20 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
     }
 
     /**
+     * Gets the listener notified when an object is destroyed on return because
+     * it failed validation, exceeded {@code maxIdle}, or because the pool was
+     * closed.
+     *
+     * @return The configured {@link ObjectDestroyListener}, or {@code null} if
+     *         none has been configured (the default).
+     * @see GenericObjectPool#getObjectDestroyListener()
+     * @since 3.0.0
+     */
+    public ObjectDestroyListener<T> getObjectDestroyListener() {
+        return objectDestroyListener;
+    }
+
+    /**
      * Sets the value for the {@code maxIdle} configuration attribute for
      * pools created with this configuration instance.
      *
@@ -152,6 +170,24 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
         this.minIdle = minIdle;
     }
 
+    /**
+     * Sets the listener notified once per object when an object is destroyed on
+     * return because it failed validation, exceeded {@code maxIdle}, or because
+     * the pool was closed.
+     * <p>
+     * By default, no listener is configured and the pool behaves exactly as in
+     * previous versions.
+     * </p>
+     *
+     * @param objectDestroyListener The new {@link ObjectDestroyListener}, or
+     *        {@code null} to disable the notification.
+     * @see GenericObjectPool#setObjectDestroyListener(ObjectDestroyListener)
+     * @since 3.0.0
+     */
+    public void setObjectDestroyListener(final ObjectDestroyListener<T> objectDestroyListener) {
+        this.objectDestroyListener = objectDestroyListener;
+    }
+
     @Override
     protected void toStringAppendFields(final StringBuilder builder) {
         super.toStringAppendFields(builder);
@@ -161,5 +197,7 @@ public class GenericObjectPoolConfig<T> extends BaseObjectPoolConfig<T> {
         builder.append(maxIdle);
         builder.append(", minIdle=");
         builder.append(minIdle);
+        builder.append(", objectDestroyListener=");
+        builder.append(objectDestroyListener);
     }
 }

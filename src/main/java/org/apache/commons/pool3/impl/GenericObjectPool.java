@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import org.apache.commons.pool3.DestroyMode;
+import org.apache.commons.pool3.DestroyReason;
+import org.apache.commons.pool3.ObjectDestroyListener;
 import org.apache.commons.pool3.ObjectPool;
 import org.apache.commons.pool3.PoolUtils;
 import org.apache.commons.pool3.PooledObject;
@@ -98,6 +100,13 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
     private volatile int minIdle = GenericObjectPoolConfig.DEFAULT_MIN_IDLE;
 
     private final PooledObjectFactory<T, E> factory;
+
+    /**
+     * Optional listener notified when a returned object is destroyed because
+     * it failed validation, exceeded {@code maxIdle}, or because the pool was
+     * closed. May be {@code null}, in which case no notifications are sent.
+     */
+    private volatile ObjectDestroyListener<T> objectDestroyListener;
 
     /*
      * TODO The references to _maxActive are from 1.x and need to be updated.
@@ -445,11 +454,22 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      */
     @Override
     public void clear() {
+        clear(null);
+    }
+
+    /**
+     * Clears the idle objects, notifying the configured
+     * {@link ObjectDestroyListener} of the supplied reason.
+     *
+     * @param destroyReason The destruction reason to report, or {@code null} not
+     *                      to report one.
+     */
+    private void clear(final DestroyReason destroyReason) {
         PooledObject<T> p = idleObjects.poll();
 
         while (p != null) {
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, destroyReason);
             } catch (final Exception e) {
                 swallowException(e);
             }
@@ -483,7 +503,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
             closed = true;
             // This clear removes any idle objects
-            clear();
+            clear(DestroyReason.POOL_CLOSED);
 
             jmxUnregister();
 
@@ -606,14 +626,69 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      *                   cleanly
      */
     private void destroy(final PooledObject<T> toDestroy, final DestroyMode destroyMode) throws E {
+        destroy(toDestroy, destroyMode, null);
+    }
+
+    /**
+     * Destroys a wrapped pooled object, notifying the configured
+     * {@link ObjectDestroyListener} when a {@link DestroyReason} is supplied.
+     * <p>
+     * The notification is delivered at most once per pooled object (objects
+     * already in the {@link PooledObjectState#INVALID INVALID} state are not
+     * notified again). A failure of the listener neither prevents the factory's
+     * {@code destroyObject} from running nor the pool counters from being
+     * updated; it is swallowed (and forwarded to the
+     * {@link SwallowedExceptionListener}) unless the factory itself fails, in
+     * which case it is attached as a suppressed exception to the factory's
+     * exception so the factory cause is retained.
+     * </p>
+     *
+     * @param toDestroy The wrapped pooled object to destroy
+     * @param destroyMode DestroyMode context provided to the factory
+     * @param destroyReason The reason for the destruction, or {@code null} for
+     *                      destruction paths that are not reported.
+     * @throws E If the factory fails to destroy the pooled object
+     *                   cleanly
+     */
+    private void destroy(final PooledObject<T> toDestroy, final DestroyMode destroyMode,
+            final DestroyReason destroyReason) throws E {
+        final ObjectDestroyListener<T> listener = objectDestroyListener;
+        RuntimeException listenerFailure = null;
+        // Notify before invalidating so each object is reported at most once.
+        if (listener != null && destroyReason != null && toDestroy.getState() != PooledObjectState.INVALID) {
+            try {
+                listener.onDestroyObject(toDestroy, destroyReason);
+            } catch (final RuntimeException e) {
+                listenerFailure = e;
+            }
+        }
         toDestroy.invalidate();
         idleObjects.remove(toDestroy);
         allObjects.remove(IdentityWrapper.unwrap(toDestroy));
+        boolean factoryFailure = false;
         try {
             factory.destroyObject(toDestroy, destroyMode);
+        } catch (final RuntimeException | Error e) {
+            factoryFailure = true;
+            if (listenerFailure != null) {
+                e.addSuppressed(listenerFailure);
+            }
+            throw e;
+        } catch (final Exception e) {
+            // The declared factory exception type E. Keep its cause untouched.
+            factoryFailure = true;
+            if (listenerFailure != null) {
+                e.addSuppressed(listenerFailure);
+            }
+            throw cast(e);
         } finally {
             destroyedCount.incrementAndGet();
             createCount.decrementAndGet();
+            if (listenerFailure != null && !factoryFailure) {
+                // The factory completed: report (and otherwise drop) the
+                // listener failure without affecting the pool.
+                swallowException(listenerFailure);
+            }
         }
     }
 
@@ -660,7 +735,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
             // Pool closed while object was being added to idle objects.
             // Make sure the returned object is destroyed rather than left
             // in the idle object pool (which would effectively be a leak)
-            clear();
+            clear(DestroyReason.POOL_CLOSED);
         }
     }
 
@@ -797,6 +872,19 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
      */
     public PooledObjectFactory<T, E> getFactory() {
         return factory;
+    }
+
+    /**
+     * Gets the listener notified when an object is destroyed on return because
+     * it failed validation, exceeded {@code maxIdle}, or because the pool was
+     * closed.
+     *
+     * @return The configured {@link ObjectDestroyListener}, or {@code null} if
+     *         none has been configured (the default).
+     * @since 3.0.0
+     */
+    public ObjectDestroyListener<T> getObjectDestroyListener() {
+        return objectDestroyListener;
     }
 
     /**
@@ -1047,7 +1135,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
         if (getTestOnReturn() && !factory.validateObject(p)) {
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, DestroyReason.RETURN_VALIDATION_FAILED);
             } catch (final Exception e) {
                 swallowException(e);
             }
@@ -1085,8 +1173,9 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
 
         final int maxIdleSave = getMaxIdle();
         if (isClosed() || maxIdleSave > -1 && maxIdleSave <= idleObjects.size()) {
+            final DestroyReason reason = isClosed() ? DestroyReason.POOL_CLOSED : DestroyReason.MAX_IDLE_EXCEEDED;
             try {
-                destroy(p, DestroyMode.NORMAL);
+                destroy(p, DestroyMode.NORMAL, reason);
             } catch (final Exception e) {
                 swallowException(e);
             }
@@ -1105,7 +1194,7 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
                 // Pool closed while object was being added to idle objects.
                 // Make sure the returned object is destroyed rather than left
                 // in the idle object pool (which would effectively be a leak)
-                clear();
+                clear(DestroyReason.POOL_CLOSED);
             }
         }
         updateStatsReturn(activeTime);
@@ -1122,6 +1211,24 @@ public class GenericObjectPool<T, E extends Exception> extends BaseGenericObject
         setMaxIdle(conf.getMaxIdle());
         setMinIdle(conf.getMinIdle());
         setMaxTotal(conf.getMaxTotal());
+        setObjectDestroyListener(conf.getObjectDestroyListener());
+    }
+
+    /**
+     * Sets the listener notified once per object when an object is destroyed on
+     * return because it failed validation, exceeded {@code maxIdle}, or because
+     * the pool was closed.
+     * <p>
+     * Passing {@code null} (the default) disables the notification and the pool
+     * behaves exactly as in previous versions.
+     * </p>
+     *
+     * @param objectDestroyListener The new {@link ObjectDestroyListener}, or
+     *        {@code null} to disable the notification.
+     * @since 3.0.0
+     */
+    public void setObjectDestroyListener(final ObjectDestroyListener<T> objectDestroyListener) {
+        this.objectDestroyListener = objectDestroyListener;
     }
 
     /**
